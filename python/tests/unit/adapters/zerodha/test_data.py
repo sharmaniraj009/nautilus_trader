@@ -23,6 +23,7 @@ from typing import cast
 
 from nautilus_trader.adapters.zerodha.common import instrument_id
 from nautilus_trader.adapters.zerodha.data import ZerodhaDataClient
+from nautilus_trader.model import IndexPriceUpdate
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import QuoteTick
@@ -46,7 +47,10 @@ class TestProvider:
     Supply a deterministic instrument-token lookup.
     """
 
-    ids_by_token: ClassVar = {408065: instrument_id("NSE", "INFY")}
+    ids_by_token: ClassVar = {
+        408065: instrument_id("NSE", "INFY"),
+        256265: instrument_id("NSE", "NIFTY 50"),
+    }
 
     def price_precision(self, _token: int) -> int:
         """
@@ -67,6 +71,7 @@ class DataHarness:
         self.clock = TestClock()
         self._quote_tokens = {408065}
         self._trade_tokens = {408065}
+        self._index_tokens: set[int] = set()
         self._last_trade: dict[int, tuple[Price, Quantity, int]] = {}
         self.data: list[object] = []
 
@@ -85,7 +90,7 @@ def test_handle_full_tick_emits_exact_quote_and_trade_once() -> None:
     tick = {
         "instrument_token": 408065,
         "last_price": 1_543.25,
-        "last_quantity": 7,
+        "last_traded_quantity": 7,
         "exchange_timestamp": datetime(2026, 9, 20, 9, 15),  # noqa: DTZ001
         "last_trade_time": datetime(2026, 9, 20, 9, 14, 59),  # noqa: DTZ001
         "depth": {
@@ -113,3 +118,99 @@ def test_handle_full_tick_emits_exact_quote_and_trade_once() -> None:
     assert trade.size == Quantity.from_int(7)
     assert trade.ts_event == 1_789_875_899_000_000_000
     assert len(str(trade.trade_id)) == 32
+
+
+class TickerHarness:
+    """
+    Record subscription calls made to the Kite ticker.
+    """
+
+    MODE_FULL = "full"
+
+    def __init__(self) -> None:
+        """
+        Initialize empty call records.
+        """
+        self.subscribed: list[list[int]] = []
+        self.unsubscribed: list[list[int]] = []
+
+    def subscribe(self, tokens: list[int]) -> bool:
+        """
+        Record a subscribe call.
+        """
+        self.subscribed.append(tokens)
+        return True
+
+    def unsubscribe(self, tokens: list[int]) -> bool:
+        """
+        Record an unsubscribe call.
+        """
+        self.unsubscribed.append(tokens)
+        return True
+
+    def set_mode(self, _mode: str, _tokens: list[int]) -> bool:
+        """
+        Accept a mode change.
+        """
+        return True
+
+
+def test_subscription_waits_for_socket_open_then_replays() -> None:
+    """
+    Subscriptions before the socket opens are deferred and replayed on connect.
+    """
+    ticker = TickerHarness()
+    client = cast("Any", DataHarness())
+    client._ticker = ticker
+    client._ws_open = False
+
+    ZerodhaDataClient._apply_subscription(client, 408065)
+    assert ticker.subscribed == []
+
+    ZerodhaDataClient._on_connect(client, ticker, None)
+    assert client._ws_open is True
+    assert ticker.subscribed == [[408065]]
+
+    ZerodhaDataClient._apply_subscription(client, 408065)
+    assert ticker.subscribed == [[408065], [408065]]
+
+
+def test_index_tick_emits_index_price_update() -> None:
+    """
+    Index ticks have no depth or trade size and become exact index price updates.
+    """
+    client = DataHarness()
+    client._index_tokens = {256265}
+    tick = {
+        "instrument_token": 256265,
+        "tradable": False,
+        "last_price": 23_346.4,
+        "exchange_timestamp": datetime(2026, 9, 21, 9, 15),  # noqa: DTZ001
+    }
+
+    ZerodhaDataClient._handle_ticks(cast("Any", client), [tick])
+
+    assert len(client.data) == 1
+    update = client.data[0]
+    assert isinstance(update, IndexPriceUpdate)
+    assert str(update.instrument_id) == "NSE:NIFTY 50.ZERODHA"
+    assert update.value == Price.from_str("23346.40")
+
+
+def test_empty_book_does_not_emit_zero_price_quote() -> None:
+    """
+    Kite reports an empty book as zero-price levels, which must not become a quote.
+    """
+    client = DataHarness()
+    tick = {
+        "instrument_token": 408065,
+        "exchange_timestamp": datetime(2026, 9, 20, 9, 15),  # noqa: DTZ001
+        "depth": {
+            "buy": [{"price": 0.0, "quantity": 0}],
+            "sell": [{"price": 0.0, "quantity": 0}],
+        },
+    }
+
+    ZerodhaDataClient._handle_ticks(cast("Any", client), [tick])
+
+    assert client.data == []

@@ -23,5 +23,5 @@ ZERODHA = "ZERODHA"
 ZERODHA_VENUE = Venue(ZERODHA)
 KITE_HTTP_URL = "https://api.kite.trade"
 KITE_WEBSOCKET_URL = "wss://ws.kite.trade"
-KITE_SANDBOX_HTTP_URL = "https://api-sandbox.kite.trade"
+KITE_SANDBOX_HTTP_URL = "https://sandbox.kite.trade"
 KITE_SANDBOX_WEBSOCKET_URL = "wss://ws-sandbox.kite.trade"
