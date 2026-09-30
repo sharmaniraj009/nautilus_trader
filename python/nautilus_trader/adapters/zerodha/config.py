@@ -35,6 +35,7 @@ class ZerodhaDataClientConfig(DataClientConfig):
 
     api_key: str
     access_token: str
+    user_id: str | None
     http_url: str
     websocket_url: str
 
@@ -43,12 +44,15 @@ class ZerodhaDataClientConfig(DataClientConfig):
         *,
         api_key: str,
         access_token: str,
+        user_id: str | None = None,
         http_url: str = KITE_HTTP_URL,
         websocket_url: str = KITE_WEBSOCKET_URL,
         **_kwargs: object,
     ) -> None:
         """
         Retain credentials and endpoint configuration without opening network resources.
+
+        The Kite sandbox WebSocket requires ``user_id``; production ignores it.
         """
         if not api_key:
             raise ValueError("api_key must not be empty")
@@ -56,6 +60,7 @@ class ZerodhaDataClientConfig(DataClientConfig):
             raise ValueError("access_token must not be empty")
         self.api_key = api_key
         self.access_token = access_token
+        self.user_id = user_id
         self.http_url = http_url.rstrip("/")
         self.websocket_url = websocket_url
 

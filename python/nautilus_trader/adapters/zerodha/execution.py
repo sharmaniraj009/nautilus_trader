@@ -136,7 +136,12 @@ class ZerodhaExecutionClient(ExecutionClient):
         for instrument in provider.list_all():
             self._handle_instrument(instrument)
 
-        ticker = new_kite_ticker(config.api_key, config.access_token, config.websocket_url)
+        ticker = new_kite_ticker(
+            config.api_key,
+            config.access_token,
+            config.websocket_url,
+            user_id=config.account_id,
+        )
         ticker.on_order_update = self._on_order_update
         ticker.on_noreconnect = self._on_noreconnect
         ticker.on_error = self._on_error

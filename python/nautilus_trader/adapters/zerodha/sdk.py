@@ -23,7 +23,13 @@ from typing import Protocol
 from typing import cast
 
 from .constants import KITE_HTTP_URL
+from .constants import KITE_SANDBOX_HTTP_URL
+from .constants import KITE_SANDBOX_WEBSOCKET_URL
 from .constants import KITE_WEBSOCKET_URL
+
+
+# The sandbox serves every SDK route under /oms except the instrument dumps.
+_SANDBOX_ROUTE_PASSTHROUGH = frozenset({"market.instruments.all", "market.instruments"})
 
 
 class _KiteClient(Protocol):
@@ -75,6 +81,12 @@ def new_kite_client(api_key: str, access_token: str, http_url: str) -> _KiteClie
         ) from e
     root = None if http_url == KITE_HTTP_URL else http_url
     client = kiteconnect.KiteConnect(api_key=api_key, access_token=access_token, root=root)
+    if http_url == KITE_SANDBOX_HTTP_URL:
+        # The SDK has no public route hook; the Kite sandbox guide prescribes this rewrite.
+        client._routes = {  # noqa: SLF001
+            key: value if key in _SANDBOX_ROUTE_PASSTHROUGH else f"/oms{value}"
+            for key, value in client._routes.items()  # noqa: SLF001
+        }
     client.set_access_token(access_token)
     return cast("_KiteClient", client)
 
@@ -84,10 +96,13 @@ def new_kite_ticker(
     access_token: str,
     websocket_url: str,
     *,
+    user_id: str | None = None,
     reconnect: bool = True,
 ) -> _KiteTickerClient:
     """
     Construct an authenticated official Kite WebSocket client.
+
+    The sandbox WebSocket requires ``user_id`` in its connection URL.
     """
     try:
         kiteconnect = import_module("kiteconnect")
@@ -96,12 +111,9 @@ def new_kite_ticker(
             "The Zerodha adapter requires the 'kiteconnect' package; install the zerodha extra",
         ) from e
     root = None if websocket_url == KITE_WEBSOCKET_URL else websocket_url
-    return cast(
-        "_KiteTickerClient",
-        kiteconnect.KiteTicker(
-            api_key,
-            access_token,
-            root=root,
-            reconnect=reconnect,
-        ),
-    )
+    ticker = kiteconnect.KiteTicker(api_key, access_token, root=root, reconnect=reconnect)
+    if websocket_url == KITE_SANDBOX_WEBSOCKET_URL:
+        if not user_id:
+            raise ValueError("The Kite sandbox WebSocket requires user_id")
+        ticker.socket_url = f"{ticker.socket_url}&user_id={user_id}"
+    return cast("_KiteTickerClient", ticker)
