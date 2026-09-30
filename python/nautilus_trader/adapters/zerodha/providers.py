@@ -29,6 +29,7 @@ from nautilus_trader.model import AssetClass
 from nautilus_trader.model import Currency
 from nautilus_trader.model import Equity
 from nautilus_trader.model import FuturesContract
+from nautilus_trader.model import IndexInstrument
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import OptionContract
 from nautilus_trader.model import OptionKind
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
 
 
 INR = Currency.from_str("INR")
+_INDEX_TICK_SIZE = Decimal("0.05")
 _INDEX_NAMES = {"BANKEX", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTY", "SENSEX"}
 
 
@@ -96,14 +98,21 @@ class ZerodhaInstrumentProvider(InstrumentProvider):
     @override
     async def load_all_async(self, filters: dict | None = None) -> None:
         """
-        Load all supported instruments, optionally restricted by exchange.
+        Load all supported instruments, optionally restricted by exchange and name.
+
+        The ``names`` filter matches the Kite ``name`` column, which holds the underlying
+        for derivatives (for example ``NIFTY``).
         """
         rows = await asyncio.to_thread(self._loader)
         exchanges = None if not filters else filters.get("exchanges")
         allowed = None if exchanges is None else set(exchanges)
+        names = None if not filters else filters.get("names")
+        allowed_names = None if names is None else set(names)
         now_ns = 0
         for row in rows:
             if allowed is not None and row["exchange"] not in allowed:
+                continue
+            if allowed_names is not None and row.get("name") not in allowed_names:
                 continue
             instrument = parse_instrument(row, now_ns)
             if instrument is None:
@@ -138,10 +147,34 @@ class ZerodhaInstrumentProvider(InstrumentProvider):
         await self.load_ids_async([instrument_id], filters)
 
 
+def _parse_index(row: dict[str, Any], tick_size: Decimal, ts_init: int) -> IndexInstrument | None:
+    exponent = tick_size.as_tuple().exponent
+    if not isinstance(exponent, int):
+        return None
+    exchange = str(row["exchange"])
+    tradingsymbol = str(row["tradingsymbol"])
+    return IndexInstrument(
+        instrument_id=instrument_id(exchange, tradingsymbol),
+        raw_symbol=Symbol(tradingsymbol),
+        currency=INR,
+        price_precision=max(0, -exponent),
+        size_precision=0,
+        price_increment=Price.from_decimal(tick_size),
+        size_increment=Quantity.from_int(1),
+        ts_event=ts_init,
+        ts_init=ts_init,
+        info={
+            "exchange": exchange,
+            "instrument_token": int(row["instrument_token"]),
+            "segment": str(row["segment"]),
+        },
+    )
+
+
 def parse_instrument(
     row: dict[str, Any],
     ts_init: int,
-) -> Equity | FuturesContract | OptionContract | None:
+) -> Equity | FuturesContract | IndexInstrument | OptionContract | None:
     """
     Parse one Kite instrument-master row into a Nautilus instrument.
     """
@@ -150,14 +183,15 @@ def parse_instrument(
     instrument_type = str(row["instrument_type"])
     tick_size = decimal_from_value(row["tick_size"])
     lot_size = int(row["lot_size"])
-    if tick_size <= 0 or lot_size <= 0:
+    if str(row["segment"]) == "INDICES":
+        # Indices are not tradeable: Kite reports no lot size and sometimes no tick size.
+        return _parse_index(row, tick_size if tick_size > 0 else _INDEX_TICK_SIZE, ts_init)
+    exponent = tick_size.as_tuple().exponent
+    if tick_size <= 0 or lot_size <= 0 or not isinstance(exponent, int):
         return None
 
     parsed_id = instrument_id(exchange, tradingsymbol)
     raw_symbol = Symbol(tradingsymbol)
-    exponent = tick_size.as_tuple().exponent
-    if not isinstance(exponent, int):
-        return None
     price_precision = max(0, -exponent)
     price_increment = Price.from_decimal(tick_size)
     info = {

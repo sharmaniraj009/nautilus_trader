@@ -24,6 +24,7 @@ from typing import Any
 
 from nautilus_trader.live.clients import MarketDataClient
 from nautilus_trader.model import AggressorSide
+from nautilus_trader.model import IndexPriceUpdate
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import QuoteTick
@@ -40,8 +41,10 @@ from .sdk import new_kite_ticker
 
 
 if TYPE_CHECKING:
+    from nautilus_trader.live import SubscribeIndexPrices
     from nautilus_trader.live import SubscribeQuotes
     from nautilus_trader.live import SubscribeTrades
+    from nautilus_trader.live import UnsubscribeIndexPrices
     from nautilus_trader.live import UnsubscribeQuotes
     from nautilus_trader.live import UnsubscribeTrades
 
@@ -59,8 +62,10 @@ class ZerodhaDataClient(MarketDataClient):
         self._ticker: _KiteTickerClient | None = None
         self._quote_tokens: set[int] = set()
         self._trade_tokens: set[int] = set()
+        self._index_tokens: set[int] = set()
         self._token_by_id: dict[object, int] = {}
         self._last_trade: dict[int, tuple[Price, Quantity, int]] = {}
+        self._ws_open = False
 
     async def _connect(self) -> None:
         provider = self._provider()
@@ -76,6 +81,7 @@ class ZerodhaDataClient(MarketDataClient):
             config.api_key,
             config.access_token,
             config.websocket_url,
+            user_id=config.user_id,
         )
         ticker.on_connect = self._on_connect
         ticker.on_ticks = self._on_ticks
@@ -87,6 +93,7 @@ class ZerodhaDataClient(MarketDataClient):
 
     async def _disconnect(self) -> None:
         ticker, self._ticker = self._ticker, None
+        self._ws_open = False
         if ticker is not None:
             await asyncio.to_thread(ticker.close)
 
@@ -111,6 +118,16 @@ class ZerodhaDataClient(MarketDataClient):
         self._last_trade.pop(token, None)
         self._apply_subscription(token)
 
+    async def _subscribe_index_prices(self, command: SubscribeIndexPrices) -> None:
+        token = self._lookup_token(command.instrument_id)
+        self._index_tokens.add(token)
+        self._apply_subscription(token)
+
+    async def _unsubscribe_index_prices(self, command: UnsubscribeIndexPrices) -> None:
+        token = self._lookup_token(command.instrument_id)
+        self._index_tokens.discard(token)
+        self._apply_subscription(token)
+
     def _provider(self) -> ZerodhaInstrumentProvider:
         provider = self.instrument_provider
         if not isinstance(provider, ZerodhaInstrumentProvider):
@@ -127,14 +144,17 @@ class ZerodhaDataClient(MarketDataClient):
         ticker = self._ticker
         if ticker is None:
             raise RuntimeError("Zerodha market data WebSocket is not connected")
-        if token not in self._quote_tokens and token not in self._trade_tokens:
+        if not self._ws_open:
+            return  # _on_connect replays the token sets once the socket opens
+        if token not in self._quote_tokens | self._trade_tokens | self._index_tokens:
             ticker.unsubscribe([token])
             return
         ticker.subscribe([token])
         ticker.set_mode(ticker.MODE_FULL, [token])
 
     def _on_connect(self, ticker: _KiteTickerClient, _response: object) -> None:
-        tokens = sorted(self._quote_tokens | self._trade_tokens)
+        self._ws_open = True
+        tokens = sorted(self._quote_tokens | self._trade_tokens | self._index_tokens)
         if tokens:
             ticker.subscribe(tokens)
             ticker.set_mode(ticker.MODE_FULL, tokens)
@@ -143,6 +163,7 @@ class ZerodhaDataClient(MarketDataClient):
         pass
 
     def _on_noreconnect(self, _ticker: _KiteTickerClient) -> None:
+        self._ws_open = False
         loop = self.loop
         if loop is not None:
             loop.call_soon_threadsafe(self.create_task, self._raise_disconnect(), "kite-disconnect")
@@ -178,11 +199,21 @@ class ZerodhaDataClient(MarketDataClient):
             price_precision = provider.price_precision(token)
             now_ns = self.clock.timestamp_ns()
             ts_event = datetime_to_ns(tick.get("exchange_timestamp"), now_ns)
+            if token in self._index_tokens and tick.get("last_price"):
+                self._handle_data(
+                    IndexPriceUpdate(
+                        instrument_id,
+                        price_from_value(tick["last_price"], price_precision),
+                        ts_event,
+                        now_ns,
+                    ),
+                )
             if token in self._quote_tokens:
                 depth = tick.get("depth") or {}
                 buys = depth.get("buy") or []
                 sells = depth.get("sell") or []
-                if buys and sells:
+                # Kite sends zero-price levels for an empty book (closed market, no liquidity).
+                if buys and sells and buys[0]["price"] > 0 and sells[0]["price"] > 0:
                     self._handle_data(
                         QuoteTick(
                             instrument_id=instrument_id,
@@ -196,7 +227,7 @@ class ZerodhaDataClient(MarketDataClient):
                     )
             if token in self._trade_tokens and "last_price" in tick:
                 price = price_from_value(tick["last_price"], price_precision)
-                quantity = quantity_from_value(tick.get("last_quantity") or 0)
+                quantity = quantity_from_value(tick.get("last_traded_quantity") or 0)
                 trade_ts = datetime_to_ns(tick.get("last_trade_time"), ts_event)
                 identity = (price, quantity, trade_ts)
                 if quantity.is_zero() or self._last_trade.get(token) == identity:
