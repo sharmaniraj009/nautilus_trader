@@ -94,6 +94,9 @@ _TERMINAL_STATUSES = {"CANCELLED", "COMPLETE", "REJECTED"}
 class _Order(Protocol):
     """
     Describe the order fields required by the Kite execution boundary.
+
+    ``price``, ``trigger_price`` and ``is_post_only`` exist only on the order types they
+    apply to (a ``MarketOrder`` has none of them), so they are read with ``getattr``.
     """
 
     instrument_id: InstrumentId
@@ -103,10 +106,7 @@ class _Order(Protocol):
     order_type: OrderType
     time_in_force: TimeInForce
     quantity: Quantity
-    price: Price | None
-    trigger_price: Price | None
     status: OrderStatus
-    is_post_only: bool
     is_reduce_only: bool
     is_quote_quantity: bool
 
@@ -175,10 +175,12 @@ class ZerodhaExecutionClient(ExecutionClient):
             "validity": "IOC" if order.time_in_force == TimeInForce.IOC else "DAY",
             "tag": kite_tag(order.client_order_id),
         }
-        if order.price is not None:
-            params["price"] = str(order.price.as_decimal())
-        if order.trigger_price is not None:
-            params["trigger_price"] = str(order.trigger_price.as_decimal())
+        price = getattr(order, "price", None)
+        trigger_price = getattr(order, "trigger_price", None)
+        if price is not None:
+            params["price"] = str(price.as_decimal())
+        if trigger_price is not None:
+            params["trigger_price"] = str(trigger_price.as_decimal())
         self.generate_order_submitted(order)
         try:
             venue_order_id = await asyncio.to_thread(self._api().place_order, **params)
@@ -410,7 +412,7 @@ class ZerodhaExecutionClient(ExecutionClient):
                 order.quantity.as_decimal() != order.quantity.as_decimal().to_integral_value(),
                 "Zerodha requires an integral order quantity",
             ),
-            (order.is_post_only, "Zerodha does not support post-only orders"),
+            (getattr(order, "is_post_only", False), "Zerodha does not support post-only orders"),
             (order.is_reduce_only, "Zerodha does not support atomic reduce-only orders"),
             (order.is_quote_quantity, "Zerodha requires orders sized in instrument units"),
         ]

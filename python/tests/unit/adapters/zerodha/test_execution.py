@@ -28,6 +28,8 @@ import pytest
 
 from nautilus_trader.adapters.zerodha.common import instrument_id
 from nautilus_trader.adapters.zerodha.execution import ZerodhaExecutionClient
+from nautilus_trader.common import Clock
+from nautilus_trader.common import OrderFactory
 from nautilus_trader.model import AccountId
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import OrderSide
@@ -35,7 +37,9 @@ from nautilus_trader.model import OrderStatus
 from nautilus_trader.model import OrderType
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
+from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
+from nautilus_trader.model import TraderId
 from nautilus_trader.model import VenueOrderId
 
 
@@ -189,6 +193,79 @@ async def test_submit_maps_order_to_exact_kite_request(
         "price": "25001.25",
     }
     assert [event[0] for event in harness.events] == ["submitted", "accepted"]
+
+
+def _real_orders() -> dict[str, Any]:
+    """
+    Build one order of each supported type with the production order factory.
+    """
+    factory = OrderFactory(TraderId.from_str("TESTER-001"), StrategyId("S-001"), Clock.new_test())
+    common = {
+        "instrument_id": instrument_id("NFO", "NIFTY26SEPFUT"),
+        "quantity": Quantity.from_int(65),
+        "time_in_force": TimeInForce.DAY,
+    }
+    price = Price.from_str("25001.25")
+    trigger = Price.from_str("24990.00")
+    return {
+        "MARKET": factory.market(order_side=OrderSide.BUY, **common),
+        "LIMIT": factory.limit(order_side=OrderSide.BUY, price=price, **common),
+        "SL-M": factory.stop_market(order_side=OrderSide.SELL, trigger_price=trigger, **common),
+        "SL": factory.stop_limit(order_side=OrderSide.SELL, price=price, trigger_price=trigger, **common),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kite_type", "expected_prices"),
+    [
+        ("MARKET", {}),
+        ("LIMIT", {"price": "25001.25"}),
+        ("SL-M", {"trigger_price": "24990.00"}),
+        ("SL", {"price": "25001.25", "trigger_price": "24990.00"}),
+    ],
+)
+async def test_submit_accepts_every_real_order_type(
+    monkeypatch: pytest.MonkeyPatch,
+    kite_type: str,
+    expected_prices: dict[str, str],
+) -> None:
+    """
+    Real orders lack the fields that do not apply to their type; submit must not require them.
+
+    A market order has no ``price``, ``trigger_price`` or ``is_post_only``. Reading them
+    directly raised ``AttributeError`` and left the order unsent.
+    """
+    run_inline = AsyncMock(side_effect=lambda function, **kwargs: function(**kwargs))
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    harness = ExecutionHarness()
+
+    await ZerodhaExecutionClient._submit(cast("Any", harness), _real_orders()[kite_type])
+
+    request = harness.api.request
+    assert request is not None
+    assert request["order_type"] == kite_type
+    assert request["quantity"] == 65
+    assert request["validity"] == "DAY"
+    assert {key: request[key] for key in ("price", "trigger_price") if key in request} == expected_prices
+    assert [event[0] for event in harness.events] == ["submitted", "accepted"]
+
+
+def test_validate_denies_the_default_time_in_force_on_a_real_order() -> None:
+    """
+    The order factory defaults to GTC, which Kite does not offer; the denial must be a message.
+    """
+    factory = OrderFactory(TraderId.from_str("TESTER-001"), StrategyId("S-001"), Clock.new_test())
+    order = factory.market(
+        instrument_id=instrument_id("NFO", "NIFTY26SEPFUT"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_int(65),
+    )
+
+    error = ZerodhaExecutionClient._validate_order(cast("Any", ExecutionHarness()), cast("Any", order))
+
+    assert error is not None
+    assert "time in force" in error
 
 
 def test_parse_order_report_preserves_partial_fill_and_stop_price() -> None:
